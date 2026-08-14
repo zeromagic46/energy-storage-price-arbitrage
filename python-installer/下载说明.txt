@@ -1,0 +1,22 @@
+Python 安装程序下载说明
+========================
+
+本工具包因体积原因未内置Python安装程序, 请按以下方式获取:
+
+1. 官方下载 (推荐):
+   https://www.python.org/downloads/windows/
+   选择 Python 3.12.x - Windows installer (64-bit)
+
+2. 国内镜像 (官方慢时用):
+   https://mirrors.huaweicloud.com/python/3.12.10/
+   下载 python-3.12.10-amd64.exe
+
+3. 安装时务必勾选:
+   [x] Add Python to PATH   (最重要, 不勾bat脚本找不到python)
+
+4. 装完后回到上级文件夹:
+   有网 -> 双击 1-Install-Online.bat
+   没网 -> 双击 2-Install-Offline.bat (离线包按Python 3.12下载,
+           所以装Python时请选3.12版本)
+
+下载好的Python安装程序(.exe)可以放进本文件夹存档, 方便下次装机。
