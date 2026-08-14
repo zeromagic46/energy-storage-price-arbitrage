@@ -1,0 +1,34 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+
+# ---- 临时/备份文件 ----
+*.bak
+*.bak_*
+*~
+
+# ---- 离线安装包 (52个whl, 约115MB, 不适合放进Git历史) ----
+# 需要离线安装能力的话, 把 packages/ 打包成 zip 上传到 GitHub Release 附件,
+# 在 README 里放下载链接, 不要直接提交进仓库。
+/packages/
+
+# ---- 运行产物 (命令行回测自动生成的结果, 不是源码, 不必入库) ----
+/output/*
+!/output/结果会输出到这里.txt
+
+# ---- Streamlit 本地敏感配置 (如果以后加了secrets.toml) ----
+.streamlit/secrets.toml
+scripts/.streamlit/secrets.toml
+
+# ---- 用户可能顺手放进来的 Python 安装程序 ----
+/python-installer/*.exe
+
+# ---- OS / 编辑器杂项 ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
