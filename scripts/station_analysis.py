@@ -437,14 +437,16 @@ def solve_schedule_fixed_duration(df: pd.DataFrame, bat: BatteryConfig, risk: Ri
 def solve_day_with_cycle_rule(day_df: pd.DataFrame, bat: BatteryConfig, risk: RiskConfig,
                                dt_hours: float, duration_h: float,
                                min_block_slots: int, cycles_per_day: int,
-                               date_str: str = "") -> tuple[pd.DataFrame, dict]:
+                               date_str: str = "",
+                               second_cycle_min_spread: float = SECOND_CYCLE_MIN_SPREAD,
+                               second_cycle_fallback: str = SECOND_CYCLE_FALLBACK) -> tuple[pd.DataFrame, dict]:
     """
     带"第二循环价差规则"的单日求解(仅每日>=2次循环时生效):
       1. 先按 严格交替(充1->放1->充2->放2) 求全循环方案;
       2. 从解里取第二循环的充/放窗口均价, 算第二循环价差;
-      3. 若价差 < SECOND_CYCLE_MIN_SPREAD:
-           SECOND_CYCLE_FALLBACK="skip"        -> 重解为当日一充一放;
-           SECOND_CYCLE_FALLBACK="charge_only" -> 重解为 充-放-充 (第二循环只做
+      3. 若价差 < second_cycle_min_spread:
+           second_cycle_fallback="skip"        -> 重解为当日一充一放;
+           second_cycle_fallback="charge_only" -> 重解为 充-放-充 (第二循环只做
              低价充电, 电留到次日, 成本记当日、收益经SOC跨天传递在次日体现)。
     返回的 summary 额外带 n_cycles_final / cycle2_spread / cycle_rule 字段。
     """
@@ -464,11 +466,11 @@ def solve_day_with_cycle_rule(day_df: pd.DataFrame, bat: BatteryConfig, risk: Ri
         return df_out, summary
     sp2 = dw[1]["avg_price"] - cw[1]["avg_price"]
     summary["cycle2_spread"] = sp2
-    if sp2 >= SECOND_CYCLE_MIN_SPREAD:
+    if sp2 >= second_cycle_min_spread:
         return df_out, summary
 
     # 第二循环价差不足 -> 按回退模式重解
-    if SECOND_CYCLE_FALLBACK == "charge_only":
+    if second_cycle_fallback == "charge_only":
         try:
             df2, s2 = solve_schedule_fixed_duration(
                 day_df, bat, risk, dt_hours=dt_hours, duration_h=duration_h,
@@ -477,7 +479,7 @@ def solve_day_with_cycle_rule(day_df: pd.DataFrame, bat: BatteryConfig, risk: Ri
             if s2["status"] == "Optimal":
                 s2["n_cycles_final"] = 1
                 s2["cycle2_spread"] = sp2
-                s2["cycle_rule"] = (f"第二循环价差{sp2:.0f}<{SECOND_CYCLE_MIN_SPREAD:.0f}, "
+                s2["cycle_rule"] = (f"第二循环价差{sp2:.0f}<{second_cycle_min_spread:.0f}, "
                                      f"改为只做低价充电留到次日")
                 return df2, s2
         except Exception:
@@ -489,7 +491,7 @@ def solve_day_with_cycle_rule(day_df: pd.DataFrame, bat: BatteryConfig, risk: Ri
         n_charge_blocks=1, n_discharge_blocks=1)
     s1["n_cycles_final"] = 1
     s1["cycle2_spread"] = sp2
-    s1["cycle_rule"] = f"第二循环价差{sp2:.0f}<{SECOND_CYCLE_MIN_SPREAD:.0f}, 当日仅一充一放"
+    s1["cycle_rule"] = f"第二循环价差{sp2:.0f}<{second_cycle_min_spread:.0f}, 当日仅一充一放"
     return df1, s1
 
 
@@ -629,7 +631,10 @@ def run_pipeline(xlsx_path: str, sheet_name=0, price_type: str | None = None,
                   date_start: str | None = None, date_end: str | None = None,
                   degradation_cost_per_mwh: float = DEGRADATION_COST_PER_MWH,
                   round_trip_eff: float = ROUND_TRIP_EFF,
-                  annual_cycle_cap: float | None = ANNUAL_CYCLE_CAP) -> dict:
+                  annual_cycle_cap: float | None = ANNUAL_CYCLE_CAP,
+                  min_spread_4h: float = MIN_SPREAD_4H,
+                  second_cycle_min_spread: float = SECOND_CYCLE_MIN_SPREAD,
+                  second_cycle_fallback: str = SECOND_CYCLE_FALLBACK) -> dict:
     """
     跑完整流程: 读数据 -> 逐日峰谷分析 -> 挑选全年可执行完整充放的天数(受循环预算约束)
     -> 按日期顺序求解(SOC跨天连续传递) -> 汇总。
@@ -703,7 +708,7 @@ def run_pipeline(xlsx_path: str, sheet_name=0, price_type: str | None = None,
         raise ValueError("没有可用的数据行 (所有日期都被跳过或表格为空), 请检查Excel格式和数值是否正常。")
 
     # ---- 1. 逐日价差门槛快筛(不求解) ----
-    # 门槛一(价差门槛): 最优N小时峰值窗口均价 - 谷值窗口均价 >= MIN_SPREAD_4H,
+    # 门槛一(价差门槛): 最优N小时峰值窗口均价 - 谷值窗口均价 >= min_spread_4h,
     #   不过门槛的天直接待机, 连MILP都不跑。
     # 门槛二(收益门槛): 过了价差门槛的天, 在下面主循环里正式求解(用跨天传递的
     #   真实SOC), 净收益>0才启用; <=0则当日转待机。单遍求解, 比"先预估再正式"快一倍。
@@ -712,7 +717,7 @@ def run_pipeline(xlsx_path: str, sheet_name=0, price_type: str | None = None,
     for d in valid_dates:
         w4 = best_4h_windows(day_frames[d], dt_hours, window_h=duration_h)
         spread_4h_by_date[d] = w4["spread_4h"]
-        passes_gate[d] = bool(w4["spread_4h"] >= MIN_SPREAD_4H)
+        passes_gate[d] = bool(w4["spread_4h"] >= min_spread_4h)
 
     # ---- 2. 330次/年是"最低保证利用率"目标(下限, 来自投资测算), 不是上限 ----
     n_dataset_days = len(valid_dates)
@@ -744,7 +749,9 @@ def run_pipeline(xlsx_path: str, sheet_name=0, price_type: str | None = None,
                 _, est_sum = solve_day_with_cycle_rule(
                     day_frames[d], bat, risk, dt_hours=dt_hours,
                     duration_h=duration_h, min_block_slots=min_block_slots,
-                    cycles_per_day=cycles_per_day, date_str=d)
+                    cycles_per_day=cycles_per_day, date_str=d,
+                    second_cycle_min_spread=second_cycle_min_spread,
+                    second_cycle_fallback=second_cycle_fallback)
                 est_profit[d] = (est_sum.get("net_profit", -1.0)
                                   if est_sum.get("status") == "Optimal" else -1.0)
             except Exception:
@@ -775,7 +782,9 @@ def run_pipeline(xlsx_path: str, sheet_name=0, price_type: str | None = None,
                 df_sol, sum_sol = solve_day_with_cycle_rule(
                     day_df, bat_day, risk, dt_hours=dt_hours,
                     duration_h=duration_h, min_block_slots=min_block_slots,
-                    cycles_per_day=cycles_per_day, date_str=d)
+                    cycles_per_day=cycles_per_day, date_str=d,
+                    second_cycle_min_spread=second_cycle_min_spread,
+                    second_cycle_fallback=second_cycle_fallback)
             except Exception:
                 df_sol, sum_sol = None, {"status": "Error", "net_profit": -1.0}
             day_profit = sum_sol.get("net_profit", -1.0)
@@ -813,7 +822,7 @@ def run_pipeline(xlsx_path: str, sheet_name=0, price_type: str | None = None,
             "ai_discharge_avg_price": ai_discharge_avg,
             "ai_spread": ai_spread,
             "idle_reason": ("" if used_flag else
-                             (f"峰谷价差{spread_4h_by_date[d]:.1f}<门槛{MIN_SPREAD_4H:.0f}元/MWh"
+                             (f"峰谷价差{spread_4h_by_date[d]:.1f}<门槛{min_spread_4h:.0f}元/MWh"
                               if not passes_gate[d]
                               else "超出年度循环预算上限, 让位给收益更高的交易日" if capped_out
                               else "完整充放净收益为负" if day_profit == day_profit and day_profit <= 0
