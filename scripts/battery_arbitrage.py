@@ -26,7 +26,6 @@ import os
 import re
 from dataclasses import dataclass
 import pandas as pd
-import pulp
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -116,77 +115,6 @@ def load_price_data(csv_path: str | None) -> pd.DataFrame:
     return df
 
 
-# ------------------------- 优化模型 (MILP) -------------------------
-
-def solve_schedule(df: pd.DataFrame, bat: BatteryConfig, risk: RiskConfig,
-                    dt_hours: float = 1.0) -> tuple[pd.DataFrame, dict]:
-    """[历史/宽松版求解器] 仅约束"总放电量<=次数×容量", 无精确充放时长、无严格交替。
-    仅供对照参考, 正式测算请以 station_analysis.solve_schedule_fixed_duration 为准
-    (网页版与命令行回测均走严格版)。"""
-    n = len(df)
-    prob = pulp.LpProblem("battery_arbitrage", pulp.LpMaximize)
-
-    charge = pulp.LpVariable.dicts("charge", range(n), lowBound=0)      # 从电网购电量 (MWh)
-    discharge = pulp.LpVariable.dicts("discharge", range(n), lowBound=0)  # 电池放出电量 (MWh)
-    is_charging = pulp.LpVariable.dicts("is_charging", range(n), cat="Binary")
-    soc = pulp.LpVariable.dicts("soc", range(n), lowBound=0)
-
-    max_e = bat.max_power_mw * dt_hours
-    cap = bat.capacity_mwh
-
-    # 目标函数: 卖电收入 - 购电成本 - 电池损耗成本
-    revenue = pulp.lpSum(discharge[t] * bat.discharge_eff * df.loc[t, "sell_price"] for t in range(n))
-    cost = pulp.lpSum(charge[t] * df.loc[t, "buy_price"] for t in range(n))
-    degradation = pulp.lpSum(discharge[t] * bat.degradation_cost_per_mwh for t in range(n))
-    prob += revenue - cost - degradation
-
-    for t in range(n):
-        # 充放电互斥 + 功率上限
-        prob += charge[t] <= max_e * is_charging[t]
-        prob += discharge[t] <= max_e * (1 - is_charging[t])
-
-        # SOC动态方程
-        prev_soc = bat.soc_init * cap if t == 0 else soc[t - 1]
-        prob += soc[t] == prev_soc + charge[t] * bat.charge_eff - discharge[t]
-
-        # SOC硬约束 (风控)
-        prob += soc[t] >= max(bat.soc_min, risk.hard_soc_min) * cap
-        prob += soc[t] <= min(bat.soc_max, risk.hard_soc_max) * cap
-
-    # 每日循环次数约束 (总放电量 / 容量 近似循环数)
-    prob += pulp.lpSum(discharge[t] for t in range(n)) <= bat.max_cycles_per_day * cap
-
-    solver = pulp.PULP_CBC_CMD(msg=0)
-    status = prob.solve(solver)
-
-    df_out = df.copy()
-    df_out["charge_mwh"] = [charge[t].value() for t in range(n)]
-    df_out["discharge_mwh"] = [discharge[t].value() for t in range(n)]
-    df_out["soc_mwh"] = [soc[t].value() for t in range(n)]
-    df_out["soc_pct"] = df_out["soc_mwh"] / cap * 100
-
-    def action(row):
-        if row["charge_mwh"] > 1e-3:
-            return f"充电 {row['charge_mwh']:.1f} MWh"
-        if row["discharge_mwh"] > 1e-3:
-            return f"放电 {row['discharge_mwh']:.1f} MWh"
-        return "待机"
-    df_out["action"] = df_out.apply(action, axis=1)
-
-    summary = {
-        "status": pulp.LpStatus[status],
-        "total_revenue": sum(df_out["discharge_mwh"] * bat.discharge_eff * df_out["sell_price"]),
-        "total_cost": sum(df_out["charge_mwh"] * df_out["buy_price"]),
-        "total_degradation": sum(df_out["discharge_mwh"] * bat.degradation_cost_per_mwh),
-        "total_charge_mwh": df_out["charge_mwh"].sum(),
-        "total_discharge_mwh": df_out["discharge_mwh"].sum(),
-        "cycles_used": df_out["discharge_mwh"].sum() / cap,
-    }
-    summary["net_profit"] = summary["total_revenue"] - summary["total_cost"] - summary["total_degradation"]
-
-    return df_out, summary
-
-
 # ------------------------- 风险控制层 -------------------------
 
 def run_risk_checks(summary: dict, risk: RiskConfig) -> list[str]:
@@ -232,32 +160,26 @@ def plot_schedule(df_out: pd.DataFrame, out_png: str, title: str = "储能站MIL
     plt.close(fig)
 
 
-def load_price_data_xlsx_wide(xlsx_path: str, price_type: str | None = None,
-                               sheet_name=0) -> tuple[pd.DataFrame, float]:
-    """
-    读取"宽表"格式的电价Excel: 每行一天, 列为 [类型/]日期/时间列...
-    兼容两种时间列写法:
-      - 字符串 "HH:MM" (如 "00:00")
-      - Excel时间类型 datetime.time (如 time(0,0)), 常见于手工整理的表格
-    多余的分析列(最高价/最低价/充放电价差等)会被自动忽略, 不影响解析。
-
-    price_type: 若表中有多种类型(如"日前价格"和"实时价格"共存), 用此参数筛选,
-                例如 price_type="日前价格"。不传则默认使用表中第一种类型。
-    sheet_name: 数据所在sheet, 默认自动探测(遍历各sheet, 选第一个含时间列的)。
-                也可显式指定, 例如 sheet_name="贵港运通变充放电分析"。
-    """
+def _is_time_col(c) -> bool:
+    """判断某个列名是否为时间列 (datetime.time 或 "HH:MM" / "HH:MM:SS" 字符串)。"""
     import datetime as _dt
+    if isinstance(c, _dt.time):
+        return True
+    if isinstance(c, str):
+        # 兼容 "00:00" 与 "00:00:00" 两种写法
+        return bool(re.fullmatch(r"\d{1,2}:\d{2}(:\d{2})?", c.strip()))
+    return False
 
-    def _is_time_col(c):
-        if isinstance(c, _dt.time):
-            return True
-        if isinstance(c, str):
-            # 兼容 "00:00" 与 "00:00:00" 两种写法
-            return bool(re.fullmatch(r"\d{1,2}:\d{2}(:\d{2})?", c.strip()))
-        return False
 
-    # 自动定位含时间列的工作表: 若指定 sheet 没有时间列, 则遍历所有 sheet 找第一个匹配的
-    # (实测很多文件电价宽表不在第一个 sheet, 比如前面有一页"价格汇总")
+def load_price_wide_sheet(xlsx_path, sheet_name=0) -> pd.DataFrame:
+    """
+    定位并返回"含时间列"的工作表原始宽表 DataFrame (不做时间列归一化)。
+
+    与 load_price_data_xlsx_wide 共用同一套自动探测逻辑: 若指定的 sheet 没有时间列,
+    则遍历所有 sheet 找第一个匹配的 (实测很多文件电价宽表不在第一个 sheet,
+    比如前面有一页"价格汇总")。供网页版 _detect_types 复用, 保证"类型/日期"列表
+    与正式加载数据读的是同一张表, 避免两者 sheet 定位不一致导致的价格类型/日期错误。
+    """
     xl = pd.ExcelFile(xlsx_path)
     if sheet_name is None:
         sheet_candidates = xl.sheet_names
@@ -275,6 +197,27 @@ def load_price_data_xlsx_wide(xlsx_path: str, price_type: str | None = None,
             "未在任一工作表中识别到时间列(HH:MM 或 HH:MM:SS 格式, 如 00:00 / 00:15 / 00:00:00)。\n"
             "请确认 Excel 是宽表: 每行一天, 列为 [类型] [日期] 00:00 00:15 ... 23:45。"
         )
+    return raw
+
+
+def load_price_data_xlsx_wide(xlsx_path: str, price_type: str | None = None,
+                               sheet_name=0) -> tuple[pd.DataFrame, float]:
+    """
+    读取"宽表"格式的电价Excel: 每行一天, 列为 [类型/]日期/时间列...
+    兼容两种时间列写法:
+      - 字符串 "HH:MM" (如 "00:00")
+      - Excel时间类型 datetime.time (如 time(0,0)), 常见于手工整理的表格
+    多余的分析列(最高价/最低价/充放电价差等)会被自动忽略, 不影响解析。
+
+    price_type: 若表中有多种类型(如"日前价格"和"实时价格"共存), 用此参数筛选,
+                例如 price_type="日前价格"。不传则默认使用表中第一种类型。
+    sheet_name: 数据所在sheet, 默认自动探测(遍历各sheet, 选第一个含时间列的)。
+                也可显式指定, 例如 sheet_name="贵港运通变充放电分析"。
+    """
+    import datetime as _dt
+
+    # 定位含时间列的工作表 (自动探测逻辑见 load_price_wide_sheet)
+    raw = load_price_wide_sheet(xlsx_path, sheet_name=sheet_name)
 
     time_cols_raw = [c for c in raw.columns if _is_time_col(c)]
 
@@ -348,8 +291,8 @@ def load_price_data_xlsx_wide(xlsx_path: str, price_type: str | None = None,
 
 
 # ------------------------- 多日回测 -------------------------
-# (原 run_backtest()/plot_daily_profit() 已删除: 经核查未被任何入口调用的孤儿代码,
-#  且内部使用上面标注为"历史/宽松版"的 solve_schedule, 留着有被误用/误import的风险。
+# (原 run_backtest()/plot_daily_profit()/solve_schedule() 均已删除: 经核查未被任何
+#  入口调用的孤儿代码, 留着有被误用/误import的风险。
 #  多日回测请用 station_analysis.run_pipeline —— main() 的 --xlsx 分支已是这样做的。)
 
 
