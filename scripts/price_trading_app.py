@@ -13,9 +13,6 @@
   5. 按策略(每启用日严格Nh充+Nh放, 4h价差门槛+盈利门槛, SOC跨天连续)测算收益
 """
 from __future__ import annotations
-import os
-import tempfile
-
 import pandas as pd
 import streamlit as st
 import io
@@ -27,11 +24,11 @@ except ImportError:
     st.stop()
 
 import station_analysis as sa
-from battery_arbitrage import load_price_data_xlsx_wide, BatteryConfig, RiskConfig
+from battery_arbitrage import load_price_data_xlsx_wide, load_price_wide_sheet, BatteryConfig, RiskConfig
 
-st.set_page_config(page_title="节点电价分析与储能策略测算", layout="wide", page_icon="⚡")
+st.set_page_config(page_title="节点电价分析与储能策略测算", layout="wide", page_icon=":material/bolt:")
 
-# ---------------- 全局样式 (科技感升级) ----------------
+# ---------------- 全局样式 (精简版: 仅保留 config.toml 无法配置的部分) ----------------
 st.markdown("""
 <style>
 /* 顶部留白收紧 */
@@ -46,57 +43,6 @@ body {
     background-size: 40px 40px;
 }
 
-/* 指标卡片 - 悬浮发光效果 */
-div[data-testid="stMetric"] {
-    background: linear-gradient(135deg, #ffffff 0%, #f4f8fc 100%);
-    border: 1px solid #dde7f0; border-radius: 12px;
-    padding: 14px 16px 10px 16px;
-    box-shadow: 0 4px 6px -1px rgba(15,49,79,0.05), 0 2px 4px -1px rgba(15,49,79,0.03);
-    transition: all 0.3s ease-in-out;
-}
-div[data-testid="stMetric"]:hover {
-    transform: translateY(-3px);
-    box-shadow: 0 10px 15px -3px rgba(14,111,184,0.1), 0 4px 6px -2px rgba(14,111,184,0.05);
-    border-color: #0e6fb8;
-}
-div[data-testid="stMetric"] label { color: #51677d !important; font-weight: 600; }
-div[data-testid="stMetric"] value { color: #15314f !important; }
-
-/* 标签页 - 科技感下划线 */
-button[data-baseweb="tab"] {
-    font-size: 15px; font-weight: 600; color: #51677d;
-    border-bottom: 3px solid transparent;
-    transition: all 0.2s ease;
-}
-button[data-baseweb="tab"]:hover { color: #0e6fb8; border-bottom-color: #e8eef4; }
-button[data-baseweb="tab"][aria-selected="true"] {
-    color: #0e6fb8 !important;
-    border-bottom-color: #1fae5a !important;
-    box-shadow: 0 2px 4px -1px rgba(31, 174, 90, 0.2);
-}
-
-/* 表格圆角与交互 */
-div[data-testid="stDataFrame"] {
-    border-radius: 10px; overflow: hidden;
-    border: 1px solid #e3ebf3;
-    box-shadow: 0 2px 4px rgba(0,0,0,0.02);
-}
-
-/* 侧边栏底色: 深邃蓝灰质面 */
-section[data-testid="stSidebar"] {
-    background: linear-gradient(180deg, #ffffff 0%, #f4f8fc 100%);
-    border-right: 1px solid #e8eef4;
-}
-
-/* 滑块和输入框焦点高亮 */
-.stSlider > div > div > div > div {
-    background-color: #1fae5a !important;
-}
-input:focus, .stSelectbox > div > div:focus-within {
-    border-color: #0e6fb8 !important;
-    box-shadow: 0 0 0 2px rgba(14, 111, 184, 0.2) !important;
-}
-
 /* 主按钮 - 充能动画 */
 .stButton > button[kind="primary"] {
     background: linear-gradient(90deg, #0e6fb8 0%, #1fae5a 100%);
@@ -109,28 +55,6 @@ input:focus, .stSelectbox > div > div:focus-within {
     box-shadow: 0 8px 20px 0 rgba(14, 111, 184, 0.35);
 }
 
-hr { margin: 1.2rem 0; border-color: #e8eef4; }
-
-/* 自定义信息卡片(用于顶部特色数据) */
-.tech-card {
-    background: linear-gradient(135deg, #ffffff 0%, #f4f8fc 100%);
-    border: 1px solid #dbe7f1; border-radius: 12px; padding: 12px 16px;
-    box-shadow: 0 4px 6px -1px rgba(15,49,79,0.06);
-    transition: all 0.3s ease;
-}
-.tech-card:hover { transform: translateY(-2px); box-shadow: 0 10px 20px -3px rgba(14,111,184,0.1); }
-
-/* 加载动画效果 - 求解时的脉冲点 */
-.dot-pulse {
-    display: inline-block; width: 8px; height: 8px; border-radius: 50%;
-    background: #1fae5a; box-shadow: 0 0 0 0 rgba(31, 174, 90, 0.7);
-    animation: pulse 1.5s infinite;
-}
-@keyframes pulse {
-    0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(31, 174, 90, 0.7); }
-    70% { transform: scale(1); box-shadow: 0 0 0 10px rgba(31, 174, 90, 0); }
-    100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(31, 174, 90, 0); }
-}
 </style>
 """, unsafe_allow_html=True)
 
@@ -158,17 +82,19 @@ def fmt_money(v):
 
 @st.cache_data(show_spinner=False)
 def _detect_types(file_bytes: bytes, sheet_name):
-    """读取表中包含哪些价格类型(日前/实时...), 以及日期范围。"""
-    _bio = io.BytesIO(file_bytes)   # 原为临时文件, 改内存流避免 WinError 32
-    try:
-        raw = pd.read_excel(_bio, sheet_name=sheet_name)
-        type_col = next((c for c in raw.columns if "类型" in str(c)), None)
-        types = list(raw[type_col].dropna().unique()) if type_col is not None else []
-        date_col = next((c for c in raw.columns if "日期" in str(c)), None)
-        dates = sorted(raw[date_col].astype(str).str[:10].unique()) if date_col else []
-        return types, dates
-    finally:
-        pass   # 原语句已移除, 占位
+    """读取表中包含哪些价格类型(日前/实时...), 以及日期范围。
+
+    复用 load_price_wide_sheet 的同一套 sheet 自动探测逻辑, 保证"类型/日期"
+    列表与正式加载数据读的是同一张表 (否则当电价宽表不在第一个 sheet 时,
+    这里的类型/日期会读错)。
+    """
+    _bio = io.BytesIO(file_bytes)
+    raw = load_price_wide_sheet(_bio, sheet_name)
+    type_col = next((c for c in raw.columns if "类型" in str(c)), None)
+    types = list(raw[type_col].dropna().unique()) if type_col is not None else []
+    date_col = next((c for c in raw.columns if "日期" in str(c)), None)
+    dates = sorted(raw[date_col].astype(str).str[:10].unique()) if date_col else []
+    return types, dates
 
 @st.cache_data(show_spinner=False)
 def _load_long(file_bytes: bytes, sheet_name, price_type):
@@ -183,9 +109,6 @@ def _run_pipeline(file_bytes: bytes, sheet_name, price_type,
                   date_start=None, date_end=None,
                   degradation_cost=60.0, round_trip_eff=0.87, cycle_cap=None):
     _bio = io.BytesIO(file_bytes)
-    sa.MIN_SPREAD_4H = float(min_spread)
-    sa.SECOND_CYCLE_MIN_SPREAD = float(second_min_spread)
-    sa.SECOND_CYCLE_FALLBACK = second_fallback
     result = sa.run_pipeline(_bio, sheet_name=sheet_name, price_type=price_type,
                               capacity_mwh=capacity_mwh, power_mw=power_mw,
                               annual_cycles=annual_cycles, soc_init=soc_init,
@@ -193,6 +116,9 @@ def _run_pipeline(file_bytes: bytes, sheet_name, price_type,
                               degradation_cost_per_mwh=degradation_cost,
                               round_trip_eff=round_trip_eff,
                               annual_cycle_cap=cycle_cap,
+                              min_spread_4h=float(min_spread),
+                              second_cycle_min_spread=float(second_min_spread),
+                              second_cycle_fallback=second_fallback,
                               date_start=date_start, date_end=date_end)
     return {k: result[k] for k in
             ["daily", "monthly", "windows_df", "all_schedule_df", "skipped_dates",
@@ -208,8 +134,6 @@ def _solve_day(file_bytes: bytes, sheet_name, price_type, day: str,
     day_df = df_long[df_long["date"] == day].sort_values("time").reset_index(drop=True)
     if len(day_df) == 0 or day_df["price"].isna().any():
         return None, None, dt_hours
-    sa.SECOND_CYCLE_MIN_SPREAD = float(second_min_spread)
-    sa.SECOND_CYCLE_FALLBACK = second_fallback
     half_eff = round_trip_eff ** 0.5
     bat = BatteryConfig(capacity_mwh=capacity_mwh, max_power_mw=power_mw, soc_init=soc_init,
                          degradation_cost_per_mwh=degradation_cost,
@@ -220,7 +144,9 @@ def _solve_day(file_bytes: bytes, sheet_name, price_type, day: str,
     try:
         df_out, summary = sa.solve_day_with_cycle_rule(
             day_df, bat, risk, dt_hours=dt_hours, duration_h=duration_h,
-            min_block_slots=min_block_slots, cycles_per_day=cycles_per_day, date_str=day)
+            min_block_slots=min_block_slots, cycles_per_day=cycles_per_day, date_str=day,
+            second_cycle_min_spread=float(second_min_spread),
+            second_cycle_fallback=second_fallback)
     except Exception:
         return None, None, dt_hours
     if summary["status"] != "Optimal":
@@ -296,7 +222,7 @@ if isinstance(sheet_name, str) and sheet_name.isdigit():
     sheet_name = int(sheet_name)
 
 if uploaded is None:
-    st.title("⚡ 节点电价分析与储能充放电策略测算")
+    st.title(":material/bolt: 节点电价分析与储能充放电策略测算")
     st.info("请在左侧上传电价Excel文件。格式: 每行一天, 列为 [类型/日期/00:00/00:15/.../23:45], 支持日前价格与实时价格共存(用'类型'列区分)。")
     st.stop()
 
@@ -316,8 +242,8 @@ duration_h = capacity_mwh / power_mw
 st.sidebar.metric("充/放电时长 (自动=容量/功率)", f"{duration_h:.2f} 小时")
 
 _cpd_auto = 2 if duration_h <= 2.5 else 1
-cycles_per_day = st.sidebar.radio("每日充放次数", [1, 2], index=_cpd_auto - 1, horizontal=True,
-                                   help="2小时系统(容量/功率≤2h)通常一天两充两放; 4小时系统一天一充一放")
+cycles_per_day = st.sidebar.segmented_control("每日充放次数", [1, 2], default=[1, 2][_cpd_auto - 1],
+                                              help="2小时系统(容量/功率≤2h)通常一天两充两放; 4小时系统一天一充一放")
 st.sidebar.caption(f"当前: {duration_h:.0f}h系统 × 每日{cycles_per_day}次 = 每日充/放电总时长各 {duration_h*cycles_per_day:.0f} 小时")
 annual_cycles = st.sidebar.number_input("年最低利用率目标 (次/年)", min_value=1, value=330 * cycles_per_day,
                                          step=10, key=f"ac_{cycles_per_day}")
@@ -339,7 +265,7 @@ round_trip_eff = st.sidebar.slider(
     "往返效率 (%)", 70, 98, 87,
     help="充电效率×放电效率; 同时影响收入和\"是否过盈利门槛\"的判断") / 100
 
-use_cycle_cap = st.sidebar.checkbox(
+use_cycle_cap = st.sidebar.toggle(
     "启用年度循环次数硬上限", value=False,
     help="默认不限制: 只要过价差门槛且当日盈利就启用。勾选后, 超出预算的天即使自己"
          "盈利也会按估算净收益排序, 让位给收益更高的其他交易日(常见于电池质保/年度循环预算约束)")
@@ -352,26 +278,15 @@ df_long, dt_hours = _load_long(file_bytes, sheet_name, price_type)
 dates_sorted = sorted(df_long["date"].unique())
 n_slots = df_long.groupby("date").size().max()
 
-st.title("⚡ 节点电价分析与储能充放电策略测算")
-def _info_card(col, label, value, icon="⚡"):
-    col.markdown(
-        f"""<div class="tech-card">
-        <div style="font-size:12.5px;color:#51677d;margin-bottom:6px;">
-            {icon} {label}
-        </div>
-        <div style="font-size:19px;font-weight:700;color:#15314f;
-        white-space:nowrap;overflow:visible;">{value}</div>
-        </div>""",
-        unsafe_allow_html=True)
+st.title(":material/bolt: 节点电价分析与储能充放电策略测算")
 
 c1, c2, c3, c4 = st.columns(4)
-_info_card(c1, "数据天数", f"{len(dates_sorted)} 天", "📅")
-_info_card(c2, "时点颗粒度", f"{dt_hours*60:.0f}分 · {n_slots}点/天", "⏱️")
-_info_card(c3, "日期范围", f"{dates_sorted[0]} ~ {dates_sorted[-1]}", "🛰️")
-_info_card(c4, "价格类型", price_type or "全部", "📊")
-st.write("")
+c1.metric("数据天数", f"{len(dates_sorted)} 天", border=True)
+c2.metric("时点颗粒度", f"{dt_hours*60:.0f}分 · {n_slots}点/天", border=True)
+c3.metric("日期范围", f"{dates_sorted[0]} ~ {dates_sorted[-1]}", border=True)
+c4.metric("价格类型", price_type or "全部", border=True)
 
-tab1, tab2, tab3 = st.tabs(["② 单日分析·区间峰谷均价", "③ 环比/同比对比", "④ 充放电策略·收益测算"])
+tab1, tab2, tab3 = st.tabs(["单日分析", "环比/同比", "充放电策略·收益测算"])
 
 # ---------------------------------------------------------------- tab 1
 with tab1:
@@ -397,8 +312,11 @@ with tab1:
         if sel_day and m1 is not None:
             gate_pass = m1['spread_4h'] >= min_spread
             st.metric(f"最优{duration_h:.0f}h价差(门槛口径)", f"{m1['spread_4h']:.1f} 元/MWh",
-                       delta=f"{m1['spread_4h']-min_spread:+.1f} vs 门槛", delta_color="normal")
-            if not gate_pass:
+                       delta=f"{m1['spread_4h']-min_spread:+.1f} vs 门槛", delta_color="normal", border=True)
+            if gate_pass:
+                st.badge("已过价差门槛", icon=":material/check:", color="green")
+            else:
+                st.badge("未过价差门槛", color="red")
                 st.error(f"价差 {m1['spread_4h']:.1f} < 门槛 {min_spread:.0f}, 当日按策略**待机**。下方方案仅供参考。")
             if day_summary:
                 cw = [w for w in day_windows if w["action"] == "充电"]
@@ -408,10 +326,10 @@ with tab1:
                 c_avg = sum(w["energy_mwh"] * w["avg_price"] for w in cw) / ce if ce else 0
                 d_avg = sum(w["energy_mwh"] * w["avg_price"] for w in dw) / de if de else 0
                 st.metric("套利价差(策略执行口径)", f"{d_avg - c_avg:.1f} 元/MWh",
-                           delta=f"净收益 {fmt_money(day_summary['net_profit'])}", delta_color="off")
+                           delta=f"净收益 {fmt_money(day_summary['net_profit'])}", delta_color="off", border=True)
                 rule = day_summary.get("cycle_rule", "")
                 st.caption(f"实际{day_summary.get('n_cycles_final', cycles_per_day)}次循环 · 循环 {day_summary['cycles_used']:.2f} 次"
-                            + (f"  \n⚠ {rule}" if rule else ""))
+                            + (f"  \n:material/warning: {rule}" if rule else ""))
     with chart_col:
         if sel_day and m1 is not None:
             ddf1 = day_slice(df_long, sel_day)
@@ -420,7 +338,7 @@ with tab1:
             times = ddf1["time"].tolist()
             if day_windows:
                 if m1['spread_4h'] < min_spread:
-                    st.warning("⚠ 该日未过启用门槛, 按策略为待机日, 以下时段仅供参考")
+                    st.warning("该日未过启用门槛, 按策略为待机日, 以下时段仅供参考", icon=":material/warning:")
                 ci = di = 0
                 for w in day_windows:
                     if w["action"] == "充电":
@@ -440,7 +358,7 @@ with tab1:
             figd.update_layout(height=430, yaxis_title="电价 (元/MWh)", xaxis_title="时段",
                                 xaxis=dict(type="category"), margin=dict(t=30),
                                 legend=dict(orientation="h", y=1.1))
-            st.plotly_chart(style_fig(figd), use_container_width=True)
+            st.plotly_chart(style_fig(figd))
             if day_windows:
                 wdf = pd.DataFrame(day_windows)
                 wdf = wdf[["action", "start_time", "end_time", "duration_h", "energy_mwh", "avg_price"]].copy()
@@ -449,9 +367,8 @@ with tab1:
                 wdf["energy_mwh"] = wdf["energy_mwh"].round(1)
                 wdf["avg_price"] = wdf["avg_price"].round(1)
                 wdf.columns = ["动作", "开始", "结束", "时长", "电量", "均价"]
-                st.dataframe(wdf, use_container_width=True, hide_index=True)
+                st.dataframe(wdf, hide_index=True)
 
-    st.divider()
     st.subheader("区间分析: 每日最高/最低均价曲线")
     dcol1, dcol2 = st.columns(2)
     d_start = dcol1.selectbox("起始日期", dates_sorted, index=0)
@@ -472,7 +389,8 @@ with tab1:
             })
         spread_df = pd.DataFrame(rows)
         if len(spread_df):
-            caliber = st.radio("均价口径", [f"最优{duration_h:.0f}h窗口均价", "85/15分位峰谷段均价"], horizontal=True)
+            caliber = st.segmented_control("均价口径", [f"最优{duration_h:.0f}h窗口均价", "85/15分位峰谷段均价"],
+                                           default=f"最优{duration_h:.0f}h窗口均价")
             if caliber.startswith("最优"):
                 hi_col, lo_col, sp_col = "最优窗口峰均价", "最优窗口谷均价", "最优时长窗口价差"
                 hi_name, lo_name = f"每日最高均价 (最优{duration_h:.0f}h峰窗)", f"每日最低均价 (最优{duration_h:.0f}h谷窗)"
@@ -487,30 +405,30 @@ with tab1:
             if len(spread_df) > 31: _xcfg["rangeslider"] = dict(visible=True, thickness=0.09)
             fig.update_layout(height=460 if len(spread_df) > 31 else 400, yaxis_title="电价 (元/MWh)", xaxis_title="日期",
                               xaxis=_xcfg, legend=dict(orientation="h", y=1.12), margin=dict(t=30))
-            st.plotly_chart(style_fig(fig), use_container_width=True)
-            if len(spread_df) > 31: st.caption("💡 图下方滑块可拖拽/缩放查看长时间跨度")
+            st.plotly_chart(style_fig(fig))
+            if len(spread_df) > 31: st.caption(":material/lightbulb: 图下方滑块可拖拽/缩放查看长时间跨度")
 
             hi_idx = spread_df[hi_col].idxmax()
             lo_idx = spread_df[lo_col].idxmin()
             n_days_rng = spread_df[hi_col].notna().sum()
             t1c, t2c, t3c = st.columns(3)
-            t1c.metric(f"区间最高均价 (Σ/{n_days_rng}天)", f"{spread_df[hi_col].mean():.1f}", delta=f"最高单日 {spread_df[hi_col].max():.0f}", delta_color="off")
-            t2c.metric(f"区间最低均价 (Σ/{n_days_rng}天)", f"{spread_df[lo_col].mean():.1f}", delta=f"最低单日 {spread_df[lo_col].min():.0f}", delta_color="off")
-            t3c.metric("平均价差", f"{spread_df[sp_col].mean():.1f}", delta=f"{spread_df[sp_col].mean()-min_spread:+.0f} vs 门槛")
+            t1c.metric(f"区间最高均价 (Σ/{n_days_rng}天)", f"{spread_df[hi_col].mean():.1f}", delta=f"最高单日 {spread_df[hi_col].max():.0f}", delta_color="off", border=True)
+            t2c.metric(f"区间最低均价 (Σ/{n_days_rng}天)", f"{spread_df[lo_col].mean():.1f}", delta=f"最低单日 {spread_df[lo_col].min():.0f}", delta_color="off", border=True)
+            t3c.metric("平均价差", f"{spread_df[sp_col].mean():.1f}", delta=f"{spread_df[sp_col].mean()-min_spread:+.0f} vs 门槛", border=True)
 
             with st.expander("每日价差柱状图 / 峰谷持续时长 / 明细表下载"):
                 fig_sp = go.Figure()
                 fig_sp.add_trace(go.Bar(x=spread_df["date"], y=spread_df[sp_col], name="价差", marker_color="#6a51a3"))
                 fig_sp.add_hline(y=min_spread, line_dash="dash", line_color="red", annotation_text=f"门槛 {min_spread:.0f}")
                 fig_sp.update_layout(height=300, yaxis_title="价差 (元/MWh)", xaxis=dict(type="category"), margin=dict(t=30))
-                st.plotly_chart(style_fig(fig_sp), use_container_width=True)
+                st.plotly_chart(style_fig(fig_sp))
 
                 fig2 = go.Figure()
                 fig2.add_trace(go.Bar(x=spread_df["date"], y=spread_df["峰段持续"], name="峰段持续", marker_color="#d62728"))
                 fig2.add_trace(go.Bar(x=spread_df["date"], y=spread_df["谷段持续"], name="谷段持续", marker_color="#2ca02c"))
                 fig2.update_layout(height=280, barmode="group", yaxis_title="小时", xaxis=dict(type="category"), legend=dict(orientation="h", y=1.15), margin=dict(t=30))
-                st.plotly_chart(style_fig(fig2), use_container_width=True)
-                st.dataframe(spread_df.round(1), use_container_width=True, hide_index=True)
+                st.plotly_chart(style_fig(fig2))
+                st.dataframe(spread_df.round(1), hide_index=True)
                 st.download_button("下载CSV", spread_df.to_csv(index=False).encode("utf-8-sig"), file_name=f"峰谷均价_{d_start}_{d_end}.csv")
 
 # ---------------------------------------------------------------- tab 2
@@ -544,7 +462,7 @@ with tab2:
                 fig.add_trace(price_curve_trace(day_slice(df_long, cmp_mom), f"{cmp_mom} (同比)", color="#2ca02c", dash="dot"))
                 compare_days.append(("同比", cmp_mom))
             fig.update_layout(height=420, yaxis_title="电价 (元/MWh)", xaxis_title="时段", xaxis=dict(type="category"), legend=dict(orientation="h", y=1.1), margin=dict(t=30))
-            st.plotly_chart(style_fig(fig), use_container_width=True)
+            st.plotly_chart(style_fig(fig))
 
     if sel_d:
         mcols = st.columns(len(compare_days))
@@ -558,10 +476,9 @@ with tab2:
             delta = None
             if label == "当日": base_spread = sp
             elif base_spread is not None: delta = f"{base_spread - sp:+.1f} 当日较此"
-            mcols[i].metric(f"{label} {d} 最优{duration_h:.0f}h价差", f"{sp:.1f} 元/MWh", delta)
+            mcols[i].metric(f"{label} {d} 最优{duration_h:.0f}h价差", f"{sp:.1f} 元/MWh", delta, border=True)
             mcols[i].caption(f"最高均价 {m['peak4h_avg']:.0f} · 最低均价 {m['valley4h_avg']:.0f}")
 
-    st.divider()
     st.subheader("区间对比: 充电/放电均价曲线 vs 环比期/同比期")
     rc1, rc2 = st.columns(2)
     r_start = rc1.selectbox("起始日期", dates_sorted, index=0, key="cmp_rs")
@@ -577,9 +494,9 @@ with tab2:
         tb_avail = any(d in _dset for d in tb_dates)
 
         opt_c1, opt_c2 = st.columns(2)
-        if hb_avail: show_hb = opt_c1.checkbox(f"叠加环比期 ({hb_dates[0]} ~ {hb_dates[-1]})", value=True)
+        if hb_avail: show_hb = opt_c1.toggle(f"叠加环比期 ({hb_dates[0]} ~ {hb_dates[-1]})", value=True)
         else: show_hb = False; opt_c1.caption(f"环比期无数据")
-        if tb_avail: show_tb = opt_c2.checkbox(f"叠加同比期 ({tb_dates[0]} ~ {tb_dates[-1]})", value=True)
+        if tb_avail: show_tb = opt_c2.toggle(f"叠加同比期 ({tb_dates[0]} ~ {tb_dates[-1]})", value=True)
         else: show_tb = False; opt_c2.caption(f"同比期无数据")
 
         cur_df = build_range_df(df_long, cur_dates, dt_hours, duration_h)
@@ -603,16 +520,16 @@ with tab2:
         _xcfg2 = dict(type="category")
         if len(cur_df) > 31: _xcfg2["rangeslider"] = dict(visible=True, thickness=0.09)
         fig.update_layout(height=490 if len(cur_df) > 31 else 440, yaxis_title="电价 (元/MWh)", xaxis_title="日期", xaxis=_xcfg2, legend=dict(orientation="h", y=1.18), margin=dict(t=30))
-        st.plotly_chart(style_fig(fig), use_container_width=True)
+        st.plotly_chart(style_fig(fig))
 
         def _agg(df):
             if df is None or df["spread"].notna().sum() == 0: return None
             return {"平均放电均价": df["peak_avg"].mean(), "平均充电均价": df["valley_avg"].mean(), "平均价差": df["spread"].mean()}
         cur_a, hb_a, tb_a = _agg(cur_df), _agg(hb_df), _agg(tb_df)
         m1c, m2c, m3c = st.columns(3)
-        m1c.metric("本期平均放电均价", f"{cur_a['平均放电均价']:.1f} 元/MWh")
-        m2c.metric("本期平均充电均价", f"{cur_a['平均充电均价']:.1f} 元/MWh")
-        m3c.metric("本期平均价差", f"{cur_a['平均价差']:.1f} 元/MWh")
+        m1c.metric("本期平均放电均价", f"{cur_a['平均放电均价']:.1f} 元/MWh", border=True)
+        m2c.metric("本期平均充电均价", f"{cur_a['平均充电均价']:.1f} 元/MWh", border=True)
+        m3c.metric("本期平均价差", f"{cur_a['平均价差']:.1f} 元/MWh", border=True)
         tbl_rows = []
         for key in ["平均放电均价", "平均充电均价", "平均价差"]:
             row = {"指标": key, "本期": f"{cur_a[key]:.1f}"}
@@ -624,7 +541,7 @@ with tab2:
                     pct = diff / abs(agg[key]) * 100 if agg[key] else 0
                     row[nm + "变化"] = f"{diff:+.1f} ({pct:+.1f}%)"
             tbl_rows.append(row)
-        st.dataframe(pd.DataFrame(tbl_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(tbl_rows), hide_index=True)
 
 # ---------------------------------------------------------------- tab 3
 with tab3:
@@ -635,8 +552,7 @@ with tab3:
     if bt_end < bt_start:
         st.warning("结束日期需不早于起始日期")
     
-    if st.button("🚀 开始测算", type="primary", disabled=(bt_end < bt_start)):
-        st.markdown('<span class="dot-pulse"></span> <b>引擎正在并发求解最佳调度策略...</b>', unsafe_allow_html=True)
+    if st.button("开始测算", type="primary", icon=":material/rocket_launch:", disabled=(bt_end < bt_start)):
         res = _run_pipeline(file_bytes, sheet_name, price_type,
                              capacity_mwh, power_mw, annual_cycles, min_spread, soc_init,
                              cycles_per_day, second_min_spread, second_fallback,
@@ -653,41 +569,48 @@ with tab3:
         n_active = int(daily["used_full_cycle"].sum())
         total_profit = daily["net_profit"].sum()
 
-        k1, k2, k3, k4, k5 = st.columns(5)
-        k1.metric("累计净收益", fmt_money(total_profit))
-        k2.metric("日均净收益", fmt_money(daily['net_profit'].mean()))
-        k3.metric("启用天数", f"{n_active}/{len(daily)} 天")
-        k4.metric("最低利用率目标(折算)", f"{res['target_min_days']} 天", delta=f"{n_active - res['target_min_days']:+d} 天", delta_color="normal")
-        k5.metric("盈亏平衡价差参考", f"{res['breakeven_spread']:.0f} 元/MWh")
+        with st.container(horizontal=True):
+            st.metric("累计净收益", fmt_money(total_profit), border=True,
+                      chart_data=daily["net_profit"].tolist(), chart_type="line")
+            st.metric("日均净收益", fmt_money(daily["net_profit"].mean()), border=True)
+            st.metric("启用天数", f"{n_active}/{len(daily)} 天", border=True)
+            st.metric("最低利用率目标(折算)", f"{res['target_min_days']} 天",
+                      delta=f"{n_active - res['target_min_days']:+d} 天", delta_color="normal", border=True)
+            st.metric("盈亏平衡价差参考", f"{res['breakeven_spread']:.0f} 元/MWh", border=True)
+        gap_days = n_active - res["target_min_days"]
+        if gap_days >= 0:
+            st.badge(f"利用率达标 (+{gap_days} 天)", icon=":material/check:", color="green")
+        else:
+            st.badge(f"利用率缺口 {abs(gap_days)} 天", color="orange")
         if res.get("cycle_cap_days") is not None:
             n_capped = int((daily["idle_reason"] == "超出年度循环预算上限, 让位给收益更高的交易日").sum())
-            st.caption(f"⚠ 已启用年度循环硬上限: 最多 {res['cycle_cap_days']} 天。"
+            st.caption(f":material/warning: 已启用年度循环硬上限: 最多 {res['cycle_cap_days']} 天。"
                         + (f"其中 {n_capped} 天虽自身盈利, 但收益排名靠后被让位为待机。" if n_capped else "本次测算范围内未触发上限。"))
 
         active_rows = daily[daily["used_full_cycle"]]
         if len(active_rows):
             a1, a2, a3 = st.columns(3)
-            a1.metric("AI平均充电价 (电量加权)", f"{active_rows['ai_charge_avg_price'].mean():.1f} 元/MWh")
-            a2.metric("AI平均放电价 (电量加权)", f"{active_rows['ai_discharge_avg_price'].mean():.1f} 元/MWh")
-            a3.metric("平均套利价差", f"{active_rows['ai_spread'].mean():.1f} 元/MWh")
+            a1.metric("AI平均充电价 (电量加权)", f"{active_rows['ai_charge_avg_price'].mean():.1f} 元/MWh", border=True)
+            a2.metric("AI平均放电价 (电量加权)", f"{active_rows['ai_discharge_avg_price'].mean():.1f} 元/MWh", border=True)
+            a3.metric("平均套利价差", f"{active_rows['ai_spread'].mean():.1f} 元/MWh", border=True)
 
             fig_sp = go.Figure()
             fig_sp.add_trace(go.Bar(x=active_rows["date"], y=active_rows["ai_spread"], name="当日套利价差", marker_color="#6a51a3"))
             fig_sp.add_hline(y=active_rows["ai_spread"].mean(), line_dash="dash", line_color="#e6550d", annotation_text=f"期均 {active_rows['ai_spread'].mean():.0f}")
             fig_sp.update_layout(height=300, yaxis_title="套利价差 (元/MWh)", xaxis_title="日期 (仅启用日)", xaxis=dict(type="category"), margin=dict(t=20))
-            st.plotly_chart(style_fig(fig_sp), use_container_width=True)
+            st.plotly_chart(style_fig(fig_sp))
 
         fig = go.Figure()
         colors = ["#1f77b4" if u else "#c9c9c9" for u in daily["used_full_cycle"]]
         fig.add_trace(go.Bar(x=daily["date"], y=daily["net_profit"], marker_color=colors, name="单日净收益"))
         fig.update_layout(height=380, yaxis_title="净收益 (元)", xaxis_title="日期(灰色=待机日)", xaxis=dict(type="category"), margin=dict(t=20))
-        st.plotly_chart(style_fig(fig), use_container_width=True)
+        st.plotly_chart(style_fig(fig))
 
         cum = daily[["date", "net_profit"]].copy()
         cum["累计净收益"] = cum["net_profit"].cumsum()
         fig_c = go.Figure(go.Scatter(x=cum["date"], y=cum["累计净收益"], mode="lines", fill="tozeroy", name="累计净收益", line=dict(color="#0e6fb8", width=3)))
         fig_c.update_layout(height=300, yaxis_title="累计净收益 (元)", xaxis=dict(type="category"), margin=dict(t=20))
-        st.plotly_chart(style_fig(fig_c), use_container_width=True)
+        st.plotly_chart(style_fig(fig_c))
 
         st.markdown("**按月汇总**")
         _m = monthly.copy()
@@ -695,7 +618,14 @@ with tab3:
         _m = _m.rename(columns=_mcols)
         for c in _m.columns:
             if c not in ("月份", "天数", "启用天数"): _m[c] = _m[c].round(1)
-        st.dataframe(_m, use_container_width=True, hide_index=True)
+        st.dataframe(
+            _m,
+            hide_index=True,
+            column_config={
+                "净收益合计(元)": st.column_config.NumberColumn("净收益合计(元)", format="accounting"),
+                "日均净收益(元)": st.column_config.NumberColumn("日均净收益(元)", format="accounting"),
+            },
+        )
 
         st.markdown("**查看某一天的充放电时段与当日曲线**")
         active_dates = list(daily[daily["used_full_cycle"]]["date"])
@@ -712,12 +642,12 @@ with tab3:
                 figd.add_vrect(x0=w["start_time"], x1=_x1, fillcolor=color, line_width=0, layer="below",
                                 annotation_text=w["action"], annotation_position="top left")
             figd.update_layout(height=420, yaxis_title="电价", margin=dict(t=30))
-            st.plotly_chart(style_fig(figd), use_container_width=True)
+            st.plotly_chart(style_fig(figd))
             _v = vwin[["action", "start_time", "end_time", "duration_h", "energy_mwh", "avg_price"]].copy()
             _v["duration_h"] = _v["duration_h"].round(2)
             _v["energy_mwh"] = _v["energy_mwh"].round(1)
             _v["avg_price"] = _v["avg_price"].round(1)
-            st.dataframe(_v, use_container_width=True, hide_index=True)
+            st.dataframe(_v, hide_index=True)
 
         dl1, dl2, dl3 = st.columns(3)
         dl1.download_button("逐日结果CSV", daily.to_csv(index=False).encode("utf-8-sig"), file_name="daily_result.csv")
